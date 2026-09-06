@@ -147,6 +147,7 @@
   .headcount-row:last-child{border-bottom:none;}
   .headcount-row span{font-size:14px;}
   .headcount-row input[type=number]{width:64px;margin-top:0;text-align:center;flex:none;}
+  .headcount-row input[type=text]{width:140px;margin-top:0;flex:none;}
 
   /* badges */
   .badge-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px;}
@@ -699,6 +700,20 @@ function defaultChallenge(week){
   return instantiateChallenge(PRESET_CHALLENGES[0], week);
 }
 
+async function enterAsSector(secteurName){
+  state.profile = {
+    establishment: secteurName,
+    totalPoints: 0,
+    completedChallengeIds: [],
+    completedCount: 0,
+    themeCounts: {},
+    badges: []
+  };
+  await saveProfile();
+  state.screen = 'home';
+  render();
+}
+
 function themeLabel(key){ const t = THEMES.find(t=>t.key===key); return t ? t.label : key; }
 function themeLetter(key){ const t = THEMES.find(t=>t.key===key); return t ? t.letter : '?'; }
 
@@ -748,6 +763,8 @@ let state = {
   gradingScale: null, // [{id, min, points}]
   idfmSurveys: null, // [{id, secteur, percent, theme, date, note, points}]
   sectorHeadcounts: null, // {secteur: nombre d'agents} — sert à calculer un taux de participation
+  sectorPasswords: null, // {secteur: mot de passe} — évite qu'un agent réponde au nom d'un autre secteur
+  sectorPasswordDraft: null,
   headcountDraft: null,
   playIndex: 0,
   answers: {}, // qid -> selection
@@ -821,6 +838,11 @@ async function loadAll(){
     state.sectorHeadcounts = hc ? JSON.parse(hc.value) : {};
   }catch(e){ state.sectorHeadcounts = {}; }
 
+  try{
+    const pw = await sharedGet('sector-passwords');
+    state.sectorPasswords = pw ? JSON.parse(pw.value) : {};
+  }catch(e){ state.sectorPasswords = {}; }
+
   state.screen = state.profile ? 'home' : 'onboard';
   render();
 }
@@ -848,6 +870,10 @@ async function saveSurveys(){
 async function saveHeadcounts(){
   try{ await sharedSet('sector-headcounts', JSON.stringify(state.sectorHeadcounts)); }
   catch(e){ console.error('save headcounts failed', e); }
+}
+async function saveSectorPasswords(){
+  try{ await sharedSet('sector-passwords', JSON.stringify(state.sectorPasswords)); }
+  catch(e){ console.error('save sector passwords failed', e); }
 }
 
 // ---------------------------------------------------------------
@@ -1064,18 +1090,26 @@ function renderOnboard(){
   go.className = 'primary';
   go.textContent = 'Commencer';
   go.disabled = true;
-  go.onclick = async ()=>{
-    state.profile = {
-      establishment: selected,
-      totalPoints: 0,
-      completedChallengeIds: [],
-      completedCount: 0,
-      themeCounts: {},
-      badges: []
-    };
-    await saveProfile();
-    state.screen = 'home';
-    render();
+  go.onclick = ()=>{
+    const pwd = state.sectorPasswords[selected];
+    if(pwd){
+      askPrompt({
+        title: 'Mot de passe du secteur',
+        message: "Ce secteur est protégé pour que seuls ses agents puissent répondre en son nom.",
+        placeholder: 'Mot de passe',
+        inputType: 'password',
+        confirmLabel: 'Valider',
+        onSubmit: (val)=>{
+          if(val === pwd){
+            enterAsSector(selected);
+          } else if(val){
+            showAlertModal('Mot de passe incorrect pour ce secteur.');
+          }
+        }
+      });
+    } else {
+      enterAsSector(selected);
+    }
   };
   body.appendChild(go);
 
@@ -1784,6 +1818,54 @@ function renderAdminDashboard(){
     render();
   };
   wrap.appendChild(hcSave);
+
+  const pwLbl = document.createElement('div');
+  pwLbl.className = 'section-lbl';
+  pwLbl.textContent = 'Mots de passe par secteur';
+  wrap.appendChild(pwLbl);
+  const pwLead = document.createElement('p');
+  pwLead.className = 'small';
+  pwLead.textContent = "Un mot de passe différent par secteur pour que seuls ses agents puissent répondre en son nom (évite les erreurs et le sabotage entre équipes). Laisse un champ vide pour ne pas verrouiller ce secteur. Attention : c'est un frein pratique, pas un vrai coffre-fort — le code de l'application reste consultable par quelqu'un de technique, comme le code du pôle d'appui.";
+  wrap.appendChild(pwLead);
+
+  if(!state.sectorPasswordDraft){
+    state.sectorPasswordDraft = {};
+    ESTABLISHMENTS.forEach(name=>{ state.sectorPasswordDraft[name] = state.sectorPasswords[name] || ''; });
+  }
+  const pd = state.sectorPasswordDraft;
+
+  const pwCard = document.createElement('div');
+  pwCard.className = 'card';
+  ESTABLISHMENTS.forEach(name=>{
+    const row = document.createElement('div');
+    row.className = 'headcount-row';
+    const lbl = document.createElement('span');
+    lbl.textContent = name;
+    row.appendChild(lbl);
+    const inp = document.createElement('input');
+    inp.type = 'text'; inp.placeholder = 'Aucun';
+    inp.value = pd[name];
+    inp.oninput = ()=>{ pd[name] = inp.value; };
+    row.appendChild(inp);
+    pwCard.appendChild(row);
+  });
+  wrap.appendChild(pwCard);
+
+  const pwSave = document.createElement('button');
+  pwSave.className = 'ghost';
+  pwSave.textContent = 'Enregistrer les mots de passe';
+  pwSave.onclick = async ()=>{
+    const cleaned = {};
+    ESTABLISHMENTS.forEach(name=>{
+      const v = (pd[name] || '').trim();
+      if(v) cleaned[name] = v;
+    });
+    state.sectorPasswords = cleaned;
+    await saveSectorPasswords();
+    showToast('Mots de passe enregistrés.');
+    render();
+  };
+  wrap.appendChild(pwSave);
 
   return wrap;
 }
