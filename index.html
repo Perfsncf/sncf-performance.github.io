@@ -287,8 +287,94 @@
 <body>
 <div id="app"><div style="padding:40px;text-align:center;font-family:'Barlow Condensed';color:#4B5567;">Chargement du Défi Contact…</div></div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (function(){
+
+// ---------------------------------------------------------------
+// Supabase — stockage partagé (défis, classement, enquêtes, barème, effectifs).
+// Le profil personnel de chaque agent reste sur son appareil (window.storage, non partagé).
+// ---------------------------------------------------------------
+const SUPABASE_URL = 'https://ygsfyiqkpleevdcgtyzq.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Inlnc2Z5aXFrcGxlZXZkY2d0eXpxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODg2OTcwMTcsImV4cCI6MjEwNDI3MzAxN30.N0oIzGDVZpbURSa5FiTQO3RIOQVaPBM9ZPnB0MgiTnA';
+
+let sb = null;
+try{
+  if(window.supabase && window.supabase.createClient){
+    sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+  }
+}catch(e){ console.error('Supabase init failed, using built-in shared storage instead:', e); }
+
+// Lit une clé partagée : Supabase en priorité, repli automatique sur le stockage
+// intégré de l'artefact si Supabase est indisponible (hors ligne, mal configuré, etc.)
+async function sharedGet(key){
+  if(sb){
+    try{
+      const { data, error } = await sb.from('app_storage').select('value').eq('key', key).maybeSingle();
+      if(!error) return data ? { value: data.value } : null;
+      console.error('Supabase get error, repli sur le stockage intégré:', key, error);
+    }catch(e){ console.error('Supabase get exception, repli sur le stockage intégré:', key, e); }
+  }
+  return await window.storage.get(key, true);
+}
+// Écrit une clé partagée : Supabase en priorité, repli automatique sinon.
+async function sharedSet(key, value){
+  if(sb){
+    try{
+      const { error } = await sb.from('app_storage').upsert({ key, value, updated_at: new Date().toISOString() });
+      if(!error) return { key, value };
+      console.error('Supabase set error, repli sur le stockage intégré:', key, error);
+    }catch(e){ console.error('Supabase set exception, repli sur le stockage intégré:', key, e); }
+  }
+  return await window.storage.set(key, value, true);
+}
+
+// Journalise chaque réponse d'un défi terminé, de façon anonyme (secteur, jamais l'agent).
+// Sert uniquement à calculer les statistiques par question (ex. "questions les plus ratées").
+async function logAnswers(ch, secteur, detail){
+  if(!sb) return;
+  try{
+    const rows = detail.map((d, i) => ({
+      challenge_id: ch.id,
+      week: ch.week,
+      scenario: ch.scenario || ch.title || null,
+      secteur: secteur,
+      question_index: i + 1,
+      question_prompt: d.q.prompt,
+      is_correct: !!d.isCorrect
+    }));
+    const { error } = await sb.from('answer_log').insert(rows);
+    if(error) console.error('answer_log insert error', error);
+  }catch(e){ console.error('answer_log insert exception', e); }
+}
+
+// Récupère, pour un défi donné, le taux de réussite par question (agrégé, anonyme).
+async function fetchQuestionStats(challengeId){
+  if(!sb) return null;
+  try{
+    const { data, error } = await sb.from('answer_log').select('question_index, question_prompt, is_correct').eq('challenge_id', challengeId);
+    if(error){ console.error('fetchQuestionStats error', error); return null; }
+    const map = {};
+    (data||[]).forEach(row=>{
+      const k = row.question_index;
+      if(!map[k]) map[k] = { question_index:k, prompt:row.question_prompt, total:0, correct:0 };
+      map[k].total++;
+      if(row.is_correct) map[k].correct++;
+    });
+    return Object.values(map).sort((a,b)=>a.question_index-b.question_index);
+  }catch(e){ console.error('fetchQuestionStats exception', e); return null; }
+}
+
+// Supprime le journal de réponses d'un défi précis, ou tout le journal si aucun id n'est fourni.
+async function deleteAnswerLog(challengeId){
+  if(!sb) return;
+  try{
+    let q = sb.from('answer_log').delete();
+    q = challengeId ? q.eq('challenge_id', challengeId) : q.gt('id', 0);
+    const { error } = await q;
+    if(error) console.error('deleteAnswerLog error', error);
+  }catch(e){ console.error('deleteAnswerLog exception', e); }
+}
 
 // ---------------------------------------------------------------
 // Data / constants
@@ -671,6 +757,8 @@ let state = {
   modal: null, // {type:'prompt'|'confirm'|'alert', ...} — fenêtre intégrée, remplace prompt/confirm/alert natifs
   adminUnlocked: false,
   adminTab: 'dashboard', // dashboard | challenge | surveys | scale
+  questionStats: null, // statistiques par question du défi en cours (chargées à la demande)
+  questionStatsFor: null, // id du défi auquel correspond le cache ci-dessus
   adminDraft: null,
   adminPreviewPreset: null, // index du préréglage dont on affiche le corrigé
   adminShowDraftKey: false, // afficher le corrigé du défi en cours d'édition
@@ -694,42 +782,42 @@ async function loadAll(){
   }catch(e){ state.profile = null; }
 
   try{
-    const c = await window.storage.get('challenges-data', true);
+    const c = await sharedGet('challenges-data');
     state.challengesData = c ? JSON.parse(c.value) : null;
   }catch(e){ state.challengesData = null; }
 
   if(!state.challengesData){
     state.challengesData = { current: defaultChallenge(1), archive: [] };
-    try{ await window.storage.set('challenges-data', JSON.stringify(state.challengesData), true); }catch(e){}
+    try{ await sharedSet('challenges-data', JSON.stringify(state.challengesData)); }catch(e){}
   } else {
     const resolved = resolveScenarioKey(state.challengesData.current);
     if(resolved && state.challengesData.current.scenario !== resolved){
       state.challengesData.current.scenario = resolved;
-      try{ await window.storage.set('challenges-data', JSON.stringify(state.challengesData), true); }catch(e){}
+      try{ await sharedSet('challenges-data', JSON.stringify(state.challengesData)); }catch(e){}
     }
   }
 
   try{
-    const e = await window.storage.get('establishments-data', true);
+    const e = await sharedGet('establishments-data');
     state.establishmentsData = e ? JSON.parse(e.value) : {};
   }catch(err){ state.establishmentsData = {}; }
 
   try{
-    const g = await window.storage.get('grading-scale', true);
+    const g = await sharedGet('grading-scale');
     state.gradingScale = g ? JSON.parse(g.value) : null;
   }catch(e){ state.gradingScale = null; }
   if(!state.gradingScale){
     state.gradingScale = defaultScale();
-    try{ await window.storage.set('grading-scale', JSON.stringify(state.gradingScale), true); }catch(e){}
+    try{ await sharedSet('grading-scale', JSON.stringify(state.gradingScale)); }catch(e){}
   }
 
   try{
-    const s = await window.storage.get('idfm-surveys', true);
+    const s = await sharedGet('idfm-surveys');
     state.idfmSurveys = s ? JSON.parse(s.value) : [];
   }catch(e){ state.idfmSurveys = []; }
 
   try{
-    const hc = await window.storage.get('sector-headcounts', true);
+    const hc = await sharedGet('sector-headcounts');
     state.sectorHeadcounts = hc ? JSON.parse(hc.value) : {};
   }catch(e){ state.sectorHeadcounts = {}; }
 
@@ -742,23 +830,23 @@ async function saveProfile(){
   catch(e){ console.error('save profile failed', e); }
 }
 async function saveChallenges(){
-  try{ await window.storage.set('challenges-data', JSON.stringify(state.challengesData), true); }
+  try{ await sharedSet('challenges-data', JSON.stringify(state.challengesData)); }
   catch(e){ console.error('save challenges failed', e); }
 }
 async function saveEstablishments(){
-  try{ await window.storage.set('establishments-data', JSON.stringify(state.establishmentsData), true); }
+  try{ await sharedSet('establishments-data', JSON.stringify(state.establishmentsData)); }
   catch(e){ console.error('save establishments failed', e); }
 }
 async function saveScale(){
-  try{ await window.storage.set('grading-scale', JSON.stringify(state.gradingScale), true); }
+  try{ await sharedSet('grading-scale', JSON.stringify(state.gradingScale)); }
   catch(e){ console.error('save scale failed', e); }
 }
 async function saveSurveys(){
-  try{ await window.storage.set('idfm-surveys', JSON.stringify(state.idfmSurveys), true); }
+  try{ await sharedSet('idfm-surveys', JSON.stringify(state.idfmSurveys)); }
   catch(e){ console.error('save surveys failed', e); }
 }
 async function saveHeadcounts(){
-  try{ await window.storage.set('sector-headcounts', JSON.stringify(state.sectorHeadcounts), true); }
+  try{ await sharedSet('sector-headcounts', JSON.stringify(state.sectorHeadcounts)); }
   catch(e){ console.error('save headcounts failed', e); }
 }
 
@@ -1273,6 +1361,7 @@ async function finishChallenge(){
     entry.max += maxQ;
     entry.plays += 1;
     await saveEstablishments();
+    await logAnswers(ch, estName, detail);
   }
 
   state.lastResult = {ch, detail, points, accuracy, streakBonus, alreadyPlayed};
@@ -1587,6 +1676,53 @@ function renderAdminDashboard(){
     card.appendChild(t);
   }
   wrap.appendChild(card);
+
+  const qsLbl = document.createElement('div');
+  qsLbl.className = 'section-lbl';
+  qsLbl.textContent = 'Questions les plus ratées';
+  wrap.appendChild(qsLbl);
+
+  const qsCard = document.createElement('div');
+  qsCard.className = 'card';
+
+  if(state.questionStatsFor === curId && state.questionStats){
+    if(state.questionStats.length === 0){
+      qsCard.innerHTML = `<div class="small">Aucune réponse enregistrée pour ce défi pour l'instant.</div>`;
+    } else {
+      const sorted = [...state.questionStats].sort((a,b)=> (a.correct/a.total) - (b.correct/b.total));
+      sorted.forEach(qs=>{
+        const rate = Math.round((qs.correct/qs.total)*100);
+        const row = document.createElement('div');
+        row.className = 'total-row';
+        row.style.alignItems = 'flex-start';
+        row.innerHTML = `<span style="max-width:70%;">Q${qs.question_index} — ${escapeHtml(qs.prompt)}</span><b>${rate}% (${qs.correct}/${qs.total})</b>`;
+        qsCard.appendChild(row);
+      });
+    }
+    const refresh = document.createElement('button');
+    refresh.className = 'ghost';
+    refresh.textContent = 'Actualiser';
+    refresh.onclick = async ()=>{
+      state.questionStats = await fetchQuestionStats(curId);
+      state.questionStatsFor = curId;
+      render();
+    };
+    qsCard.appendChild(refresh);
+  } else {
+    qsCard.innerHTML = `<div class="small">Charge les statistiques pour voir, question par question, le taux de réussite sur le défi en cours (données agrégées, jamais nominatives).</div>`;
+    const loadBtn = document.createElement('button');
+    loadBtn.className = 'ghost';
+    loadBtn.textContent = 'Charger les statistiques par question';
+    loadBtn.onclick = async ()=>{
+      loadBtn.textContent = 'Chargement…';
+      loadBtn.disabled = true;
+      state.questionStats = await fetchQuestionStats(curId);
+      state.questionStatsFor = curId;
+      render();
+    };
+    qsCard.appendChild(loadBtn);
+  }
+  wrap.appendChild(qsCard);
 
   const actions = document.createElement('div');
   actions.className = 'quick-actions';
@@ -2076,6 +2212,9 @@ function renderAdminReset(){
           d.history = d.history.filter(h=>h.challengeId !== curId);
         });
         await saveEstablishments();
+        await deleteAnswerLog(curId);
+        state.questionStats = null;
+        state.questionStatsFor = null;
         showToast('Résultats du défi en cours réinitialisés.');
         render();
       }
@@ -2098,6 +2237,9 @@ function renderAdminReset(){
       onConfirm: async ()=>{
         state.establishmentsData = {};
         await saveEstablishments();
+        await deleteAnswerLog(null);
+        state.questionStats = null;
+        state.questionStatsFor = null;
         showToast('Historique de jeu entièrement réinitialisé.');
         render();
       }
